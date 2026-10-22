@@ -7,6 +7,8 @@
 #   junie-herdr-install status     show whether the hooks are installed
 #   junie-herdr-install refresh    re-copy the hook script if it is installed
 #                                  (used by the Herdr startup hook after updates)
+#   junie-herdr-install install-skill   install Herdr's Junie agent skill
+#   junie-herdr-install uninstall-skill remove the skill if this plugin owns it
 #
 # The hook script is copied out of the plugin directory because GitHub-installed
 # Herdr plugins move to a new directory on every update. Existing entries in
@@ -20,6 +22,12 @@ JUNIE_CONFIG="${JUNIE_CONFIG:-$HOME/.junie/config.json}"
 DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/herdr-plugin-junie"
 HOOK="$DATA_DIR/junie-herdr-hook"
 MARKER="junie-herdr-hook"
+SKILLS_DIR="${JUNIE_SKILLS_DIR:-$HOME/.junie/skills}"
+SKILL_DIR="$SKILLS_DIR/herdr"
+SKILL="$SKILL_DIR/SKILL.md"
+SKILL_MARKER="$SKILL_DIR/.herdr-plugin-junie"
+SKILL_OWNER="herdr-plugin-junie"
+HERDR_BIN="${HERDR_BIN_PATH:-herdr}"
 
 notify() {
   printf '%s\n' "$1"
@@ -40,6 +48,54 @@ copy_hook() {
   cp "$PLUGIN_ROOT/bin/junie-herdr-hook" "$HOOK.tmp"
   chmod 755 "$HOOK.tmp"
   mv "$HOOK.tmp" "$HOOK"
+}
+
+skill_installed() {
+  [ -f "$SKILL_MARKER" ] && [ "$(sed -n '1p' "$SKILL_MARKER")" = "$SKILL_OWNER" ]
+}
+
+generate_skill() {
+  output=$1
+  command -v "$HERDR_BIN" >/dev/null 2>&1 || {
+    notify "Herdr CLI not found; install the Herdr skill with 'herdr --skill' available on PATH."
+    return 1
+  }
+  if ! "$HERDR_BIN" --skill >"$output"; then
+    notify "Could not generate the Herdr skill with '$HERDR_BIN --skill'."
+    return 1
+  fi
+  if [ ! -s "$output" ] || ! awk 'NR == 1 { if ($0 != "---") exit 1; next } $0 == "---" { found = 1; exit } END { if (!found) exit 1 }' "$output"; then
+    notify "Herdr CLI returned an empty or invalid skill; not installing it."
+    return 1
+  fi
+}
+
+install_skill() {
+  if { [ -e "$SKILL" ] || [ -e "$SKILL_MARKER" ]; } && ! skill_installed; then
+    notify "An unmanaged Herdr skill already exists in $SKILL_DIR; leaving it unchanged."
+    return 1
+  fi
+  mkdir -p "$SKILL_DIR"
+  skill_tmp=$(mktemp "$SKILL_DIR/.SKILL.md.tmp.XXXXXX")
+  if ! generate_skill "$skill_tmp"; then
+    rm -f "$skill_tmp"
+    return 1
+  fi
+  marker_tmp=$(mktemp "$SKILL_DIR/.herdr-plugin-junie.tmp.XXXXXX")
+  printf '%s\n' "$SKILL_OWNER" >"$marker_tmp"
+  mv "$marker_tmp" "$SKILL_MARKER"
+  mv "$skill_tmp" "$SKILL"
+  notify "Herdr skill installed at $SKILL."
+}
+
+uninstall_skill() {
+  if skill_installed; then
+    rm -f "$SKILL" "$SKILL_MARKER"
+    rmdir "$SKILL_DIR" 2>/dev/null || true
+    notify "Herdr skill removed from $SKILL_DIR."
+  else
+    notify "No plugin-managed Herdr skill found in $SKILL_DIR; leaving files unchanged."
+  fi
 }
 
 installed() {
@@ -108,6 +164,15 @@ case "${1:-status}" in
     if installed; then
       copy_hook
     fi
+    if skill_installed; then
+      install_skill
+    fi
+    ;;
+  install-skill)
+    install_skill
+    ;;
+  uninstall-skill)
+    uninstall_skill
     ;;
   status)
     if installed; then
@@ -115,9 +180,16 @@ case "${1:-status}" in
     else
       notify "Junie hooks are not installed. Run the 'Install Junie hooks' action."
     fi
+    if skill_installed; then
+      notify "Herdr skill is installed at $SKILL."
+    elif [ -e "$SKILL" ]; then
+      notify "An unmanaged Herdr skill exists at $SKILL."
+    else
+      notify "Herdr skill is not installed. Run the 'Install Herdr skill for Junie' action."
+    fi
     ;;
   *)
-    printf 'usage: %s install|uninstall|status|refresh\n' "$0" >&2
+    printf 'usage: %s install|uninstall|status|refresh|install-skill|uninstall-skill\n' "$0" >&2
     exit 2
     ;;
 esac

@@ -23,7 +23,19 @@ contexts = ["workspace"]
 command = ["sh", "bin/junie-herdr-install", "uninstall"]
 
 [[actions]]
+id = "install-skill"
+title = "Install Herdr skill for Junie"
+contexts = ["workspace"]
+command = ["sh", "bin/junie-herdr-install", "install-skill"]
+
+[[actions]]
+id = "uninstall-skill"
+title = "Uninstall Herdr skill for Junie"
+contexts = ["workspace"]
+command = ["sh", "bin/junie-herdr-install", "uninstall-skill"]
+
+[[actions]]
 id = "status"
-title = "Junie hooks status"
+title = "Junie integration status"
 contexts = ["workspace"]
 command = ["sh", "bin/junie-herdr-install", "status"]

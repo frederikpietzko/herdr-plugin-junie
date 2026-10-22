@@ -47,9 +47,13 @@ Other actions:
 ```sh
 herdr plugin action invoke frederikpietzko.junie.status
 herdr plugin action invoke frederikpietzko.junie.uninstall-hooks
+herdr plugin action invoke frederikpietzko.junie.install-skill
+herdr plugin action invoke frederikpietzko.junie.uninstall-skill
 ```
 
-You can also run `bin/junie-herdr-install install|uninstall|status` directly, without Herdr.
+You can also run `bin/junie-herdr-install install|uninstall|status|refresh|install-skill|uninstall-skill` directly. The skill actions require the `herdr` CLI on `PATH` (or `HERDR_BIN_PATH` pointing to it).
+
+The Herdr skill action writes the output of `herdr --skill` to `~/.junie/skills/herdr/SKILL.md`, so Junie can learn how to use Herdr when relevant. The plugin refreshes this file after updates only if it was installed by this plugin; an existing unmanaged skill is left untouched. Set `JUNIE_SKILLS_DIR` to override the skills root directory.
 
 ## How it works
 
