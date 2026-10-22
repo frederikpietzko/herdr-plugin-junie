@@ -1,0 +1,29 @@
+id = "frederikpietzko.junie"
+name = "Junie"
+version = "0.1.0"
+min_herdr_version = "0.9.2"
+description = "Junie CLI support: agent state, notifications and session resume through Junie hooks"
+platforms = ["linux", "macos"]
+
+# Keep the copied hook script current after `herdr plugin update`.
+# Does nothing unless the hooks were installed with the action below.
+[[startup]]
+command = ["sh", "bin/junie-herdr-install", "refresh"]
+
+[[actions]]
+id = "install-hooks"
+title = "Install Junie hooks"
+contexts = ["workspace"]
+command = ["sh", "bin/junie-herdr-install", "install"]
+
+[[actions]]
+id = "uninstall-hooks"
+title = "Uninstall Junie hooks"
+contexts = ["workspace"]
+command = ["sh", "bin/junie-herdr-install", "uninstall"]
+
+[[actions]]
+id = "status"
+title = "Junie hooks status"
+contexts = ["workspace"]
+command = ["sh", "bin/junie-herdr-install", "status"]

@@ -1,0 +1,284 @@
+#!/bin/sh
+# Junie CLI hook -> Herdr agent state bridge.
+#
+# Junie runs this script from the hooks that `junie-herdr-install` adds to
+# ~/.junie/config.json:
+#
+#   junie-herdr-hook <JunieHookEvent>    (hook JSON payload on stdin)
+#   junie-herdr-hook watch               (internal: screen watcher, see below)
+#
+# It reports the Junie session to Herdr with `herdr pane report-agent`, the
+# documented way for an agent to support Herdr without native support:
+#
+#   SessionStart        idle + resume command for the session
+#   UserPromptSubmit    working
+#   PreToolUse          working (also leaves `blocked` after an approval)
+#   PermissionRequest   blocked (MUST be configured with "async": true)
+#   Stop / StopFailure  idle
+#   SessionEnd          release the pane
+#
+# Junie fires no hook when the user interrupts a task (Esc), when a chat-mode
+# task finishes (Stop does not run for chat tasks) or when a permission dialog
+# is answered. A small watcher therefore polls the pane's live screen once per
+# second while Junie runs and corrects the state from what Junie draws:
+# the spinner means working, a permission dialog means blocked, anything else
+# means idle. The watcher exits as soon as the Junie process is gone.
+#
+# Outside a Herdr pane the script does nothing.
+
+set -u
+set -f
+
+AGENT="junie"
+SOURCE="junie-cli"
+POLL_SECONDS="${JUNIE_HERDR_POLL_SECONDS:-1}"
+
+EVENT="${1:-}"
+
+if [ "${HERDR_ENV:-}" != "1" ] || [ -z "${HERDR_PANE_ID:-}" ] || [ -z "${HERDR_BIN_PATH:-}" ]; then
+  [ "$EVENT" = "watch" ] || cat >/dev/null 2>&1
+  exit 0
+fi
+[ "${JUNIE_HERDR:-1}" = "0" ] && { cat >/dev/null 2>&1; exit 0; }
+
+PANE_KEY=$(printf '%s' "$HERDR_PANE_ID" | tr -c 'A-Za-z0-9_-' '_')
+STATE_ROOT="${TMPDIR:-/tmp}"
+STATE_ROOT="${STATE_ROOT%/}/junie-herdr-$(id -u)"
+DIR="$STATE_ROOT/$PANE_KEY"
+mkdir -p "$DIR" 2>/dev/null || exit 0
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+now_ms() {
+  ms=$(date +%s%3N 2>/dev/null)
+  case "$ms" in '' | *[!0-9]*) ms=$(perl -MTime::HiRes=time -e 'printf "%d", time * 1000' 2>/dev/null) ;; esac
+  case "$ms" in '' | *[!0-9]*) ms=$(($(date +%s) * 1000)) ;; esac
+  printf '%s' "$ms"
+}
+
+# Herdr ignores reports whose seq is not higher than the last accepted one, so
+# use a millisecond timestamp that never goes backwards for this pane.
+next_seq() {
+  seq=$(now_ms)
+  last=$(cat "$DIR/seq" 2>/dev/null)
+  case "$last" in '' | *[!0-9]*) last=0 ;; esac
+  [ "$seq" -le "$last" ] && seq=$((last + 1))
+  printf '%s' "$seq" >"$DIR/seq"
+  printf '%s' "$seq"
+}
+
+# Extract a top-level string field from the one-line hook payload.
+json_field() {
+  printf '%s' "$PAYLOAD" | sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" | head -n 1
+}
+
+# Run a Herdr CLI call detached so Junie never waits on it.
+herdr_bg() {
+  "$HERDR_BIN_PATH" "$@" </dev/null >/dev/null 2>&1 &
+}
+
+# report <state> [message]
+report() {
+  state=$1
+  message=${2:-}
+  seq=$(next_seq)
+  session=$(cat "$DIR/session" 2>/dev/null)
+  printf '%s' "$state" >"$DIR/state"
+
+  set -- pane report-agent "$HERDR_PANE_ID" --source "$SOURCE" --agent "$AGENT" --state "$state" --seq "$seq"
+  [ -n "$message" ] && set -- "$@" --message "$message"
+  if [ -n "$session" ]; then
+    set -- "$@" --agent-session-id "$session"
+    if [ -s "$DIR/resume" ]; then
+      set -- "$@" --
+      while IFS= read -r arg; do
+        set -- "$@" "$arg"
+      done <"$DIR/resume"
+    fi
+  fi
+  herdr_bg "$@"
+}
+
+release() {
+  seq=$(next_seq)
+  herdr_bg pane release-agent "$HERDR_PANE_ID" --source "$SOURCE" --agent "$AGENT" --seq "$seq"
+  rm -f "$DIR/state" "$DIR/session" "$DIR/resume"
+}
+
+# PID of the Junie process that runs this hook (first ancestor named junie).
+find_junie_pid() {
+  pid=$PPID
+  i=0
+  while [ "$i" -lt 8 ] && [ -n "$pid" ] && [ "$pid" -gt 1 ]; do
+    comm=$(ps -o comm= -p "$pid" 2>/dev/null)
+    case "${comm##*/}" in junie | junie.exe) printf '%s' "$pid"; return 0 ;; esac
+    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# Write the command that resumes $1 into $DIR/resume, one argument per line.
+# Carries over the launch flags that change how the session behaves. Batch runs
+# (a task argument or --task) get no resume command: there is nothing to resume.
+write_resume() {
+  session=$1
+  : >"$DIR/resume"
+  pid=$(cat "$DIR/junie.pid" 2>/dev/null)
+  args=""
+  [ -n "$pid" ] && args=$(ps -o args= -p "$pid" 2>/dev/null)
+
+  keep=""
+  skip_next=0
+  first=1
+  for arg in $args; do
+    if [ "$first" = 1 ]; then first=0; continue; fi
+    if [ "$skip_next" = 1 ]; then skip_next=0; continue; fi
+    case "$arg" in
+      --task | --task=* | --review | --demo | --goal | --acp | --acp=* | --gateway* | --output-format* | --input-format*)
+        return 0 ;;
+      --brave | --sandbox | --skip-update-check | --use-local-cache)
+        keep="$keep $arg" ;;
+      --model=* | --effort=* | --provider=* | --config-location=* | --agent-mode=* | --model-location=*)
+        keep="$keep $arg" ;;
+      --model | --effort | --provider | --config-location | --agent-mode | --model-location)
+        skip_next=1 ;;
+      --prompt | --system-prompt | --session-id | -p | --project | -a | --auth | --*-api-key | --litellm-url | \
+        --json-output-file | -c | --cache-dir | --guidelines-filename | --ide-guidelines | \
+        --config-default-locations | --model-default-locations | --share-anonymous-statistics)
+        skip_next=1 ;;
+      -*) ;;
+      junie://*) ;;
+      *) return 0 ;;
+    esac
+  done
+
+  {
+    printf '%s\n' junie "--session-id=$session" --resume
+    for arg in $keep; do
+      case "$arg" in *"'"*) ;; *) printf '%s\n' "$arg" ;; esac
+    done
+  } >"$DIR/resume"
+}
+
+start_watcher() {
+  wpid=$(cat "$DIR/watcher.pid" 2>/dev/null)
+  if [ -n "$wpid" ] && kill -0 "$wpid" 2>/dev/null; then
+    return 0
+  fi
+  # Detach from Junie's hook process group so the watcher outlives this hook.
+  if command -v setsid >/dev/null 2>&1; then
+    setsid sh "$0" watch </dev/null >/dev/null 2>&1 &
+  elif command -v perl >/dev/null 2>&1; then
+    perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' sh "$0" watch </dev/null >/dev/null 2>&1 &
+  else
+    nohup sh "$0" watch </dev/null >/dev/null 2>&1 &
+  fi
+}
+
+stop_watcher() {
+  wpid=$(cat "$DIR/watcher.pid" 2>/dev/null)
+  [ -n "$wpid" ] && kill "$wpid" 2>/dev/null
+  rm -f "$DIR/watcher.pid"
+}
+
+# Classify Junie's live screen as working, blocked or idle.
+screen_state() {
+  screen=$("$HERDR_BIN_PATH" pane read "$HERDR_PANE_ID" --source detection --lines 40 2>/dev/null) || return 1
+  case "$screen" in
+    *"Allow running this command?"* | *"Or reject with a reason"*) printf blocked ;;
+    # "esc to stop" while thinking; only the spinner while a tool runs.
+    *"esc to stop"* | *⠋* | *⠙* | *⠹* | *⠸* | *⠼* | *⠴* | *⠦* | *⠧* | *⠇* | *⠏*) printf working ;;
+    *) printf idle ;;
+  esac
+}
+
+watch() {
+  printf '%s' "$$" >"$DIR/watcher.pid"
+  trap 'rm -f "$DIR/watcher.pid"; exit 0' TERM INT HUP
+  junie_pid=$(cat "$DIR/junie.pid" 2>/dev/null)
+  [ -n "$junie_pid" ] || exit 0
+
+  candidate=""
+  failures=0
+  while kill -0 "$junie_pid" 2>/dev/null; do
+    if seen=$(screen_state); then
+      failures=0
+      current=$(cat "$DIR/state" 2>/dev/null)
+      if [ -n "$current" ] && [ "$seen" != "$current" ]; then
+        # Require two identical observations in a row to ride out redraws.
+        if [ "$seen" = "$candidate" ]; then
+          report "$seen"
+          candidate=""
+        else
+          candidate=$seen
+        fi
+      else
+        candidate=""
+      fi
+    else
+      failures=$((failures + 1))
+      [ "$failures" -ge 10 ] && break
+    fi
+    sleep "$POLL_SECONDS"
+  done
+
+  # Junie is gone. If SessionEnd did not release the pane, do it now.
+  [ -s "$DIR/state" ] && [ "$(cat "$DIR/junie.pid" 2>/dev/null)" = "$junie_pid" ] && release
+  rm -f "$DIR/watcher.pid"
+}
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+if [ "$EVENT" = "watch" ]; then
+  watch
+  exit 0
+fi
+
+PAYLOAD=$(cat)
+
+case "$EVENT" in
+  SessionStart)
+    session=$(json_field session_id)
+    if pid=$(find_junie_pid); then
+      printf '%s' "$pid" >"$DIR/junie.pid"
+    fi
+    if [ -n "$session" ]; then
+      printf '%s' "$session" >"$DIR/session"
+      write_resume "$session"
+    fi
+    report idle
+    start_watcher
+    ;;
+  UserPromptSubmit)
+    report working
+    start_watcher
+    ;;
+  PreToolUse)
+    # submit/answer end the task; Stop follows immediately.
+    case "$(json_field tool_name)" in
+      submit | answer) ;;
+      *) [ "$(cat "$DIR/state" 2>/dev/null)" = working ] || report working ;;
+    esac
+    ;;
+  PermissionRequest)
+    report blocked "$(json_field permission_reason)"
+    start_watcher
+    ;;
+  Stop)
+    report idle
+    ;;
+  StopFailure)
+    report idle "$(json_field error)"
+    ;;
+  SessionEnd)
+    stop_watcher
+    release
+    ;;
+esac
+
+exit 0

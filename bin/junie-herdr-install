@@ -1,0 +1,123 @@
+#!/bin/sh
+# Install, remove or inspect the Junie hooks that report Junie's state to Herdr.
+#
+#   junie-herdr-install install    copy the hook script to a stable location and
+#                                  add the hooks to ~/.junie/config.json
+#   junie-herdr-install uninstall  remove the hooks again
+#   junie-herdr-install status     show whether the hooks are installed
+#   junie-herdr-install refresh    re-copy the hook script if it is installed
+#                                  (used by the Herdr startup hook after updates)
+#
+# The hook script is copied out of the plugin directory because GitHub-installed
+# Herdr plugins move to a new directory on every update. Existing entries in
+# config.json are kept; only entries that run junie-herdr-hook are touched, and
+# a backup of config.json is written before every change. Requires jq.
+
+set -eu
+
+PLUGIN_ROOT="${HERDR_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+JUNIE_CONFIG="${JUNIE_CONFIG:-$HOME/.junie/config.json}"
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/herdr-plugin-junie"
+HOOK="$DATA_DIR/junie-herdr-hook"
+MARKER="junie-herdr-hook"
+
+notify() {
+  printf '%s\n' "$1"
+  if [ -n "${HERDR_BIN_PATH:-}" ]; then
+    "$HERDR_BIN_PATH" notification show "Junie" --body "$1" >/dev/null 2>&1 || true
+  fi
+}
+
+need_jq() {
+  command -v jq >/dev/null 2>&1 || {
+    notify "jq is required to edit $JUNIE_CONFIG. Install jq and try again."
+    exit 1
+  }
+}
+
+copy_hook() {
+  mkdir -p "$DATA_DIR"
+  cp "$PLUGIN_ROOT/bin/junie-herdr-hook" "$HOOK.tmp"
+  chmod 755 "$HOOK.tmp"
+  mv "$HOOK.tmp" "$HOOK"
+}
+
+installed() {
+  [ -f "$JUNIE_CONFIG" ] && command -v jq >/dev/null 2>&1 &&
+    jq -e --arg m "$MARKER" '[.hooks // {} | .[]? | .[]? | .hooks[]? | .command? // "" | select(contains($m))] | length > 0' \
+      "$JUNIE_CONFIG" >/dev/null 2>&1
+}
+
+# Rewrite config.json with the jq filter in $1 (extra jq args follow).
+edit_config() {
+  filter=$1
+  shift
+  mkdir -p "$(dirname "$JUNIE_CONFIG")"
+  [ -s "$JUNIE_CONFIG" ] || printf '{}\n' >"$JUNIE_CONFIG"
+  jq -e . "$JUNIE_CONFIG" >/dev/null 2>&1 || {
+    notify "$JUNIE_CONFIG is not valid JSON; not changing it."
+    exit 1
+  }
+  cp "$JUNIE_CONFIG" "$JUNIE_CONFIG.bak-herdr-junie"
+  jq --indent 4 --arg m "$MARKER" "$@" "$filter" "$JUNIE_CONFIG" >"$JUNIE_CONFIG.tmp"
+  mv "$JUNIE_CONFIG.tmp" "$JUNIE_CONFIG"
+}
+
+# Drops every hook command that runs junie-herdr-hook, then empty entries/events.
+STRIP='
+  def strip: map(.hooks |= map(select((.command // "") | contains($m) | not)))
+             | map(select((.hooks | length) > 0));
+  if .hooks then
+    .hooks |= (with_entries(.value |= strip) | with_entries(select((.value | length) > 0)))
+    | if (.hooks | length) == 0 then del(.hooks) else . end
+  else . end
+'
+
+# PermissionRequest must stay async: a synchronous PermissionRequest hook that
+# exits 0 auto-approves the action in Junie.
+ADD='
+  def entry($event; $async):
+    { hooks: [ { type: "command", command: ("\"" + $hook + "\" " + $event), timeout: 5 }
+               + (if $async then { async: true } else {} end) ] };
+  .hooks = (.hooks // {})
+  | .hooks.SessionStart      += [entry("SessionStart"; false)]
+  | .hooks.UserPromptSubmit  += [entry("UserPromptSubmit"; true)]
+  | .hooks.PreToolUse        += [entry("PreToolUse"; true)]
+  | .hooks.PermissionRequest += [entry("PermissionRequest"; true)]
+  | .hooks.Stop              += [entry("Stop"; false)]
+  | .hooks.StopFailure       += [entry("StopFailure"; false)]
+  | .hooks.SessionEnd        += [entry("SessionEnd"; false)]
+'
+
+case "${1:-status}" in
+  install)
+    need_jq
+    copy_hook
+    edit_config "$STRIP | $ADD" --arg hook "$HOOK"
+    notify "Junie hooks installed in $JUNIE_CONFIG. Restart running Junie sessions to pick them up."
+    ;;
+  uninstall)
+    need_jq
+    if installed; then
+      edit_config "$STRIP"
+    fi
+    rm -f "$HOOK"
+    notify "Junie hooks removed from $JUNIE_CONFIG."
+    ;;
+  refresh)
+    if installed; then
+      copy_hook
+    fi
+    ;;
+  status)
+    if installed; then
+      notify "Junie hooks are installed in $JUNIE_CONFIG (script: $HOOK)."
+    else
+      notify "Junie hooks are not installed. Run the 'Install Junie hooks' action."
+    fi
+    ;;
+  *)
+    printf 'usage: %s install|uninstall|status|refresh\n' "$0" >&2
+    exit 2
+    ;;
+esac
