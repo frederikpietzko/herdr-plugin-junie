@@ -110,3 +110,7 @@ herdr pane get "$HERDR_PANE_ID"
 ```
 
 To test session restore without touching your normal session, use `herdr --session junie-test`, start Junie, stop the session with `herdr session stop junie-test`, and start it again.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
